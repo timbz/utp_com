@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <scsi/sg_lib.h>
@@ -141,9 +142,9 @@ int send_cmd(int device_fd, struct utp_cmd *cmd, void *dxferp, int dxferp_len, u
 int main(int argc, char * argv[])
 {
 	int c;
-	int ret;
-	int file_fd;
-	int device_fd;
+	int ret = 1;
+	int file_fd = 0;
+	int device_fd = 0;
 	struct stat st;
 	char *command = NULL;
 	char *file_name = NULL;
@@ -182,51 +183,6 @@ int main(int argc, char * argv[])
 		return 1;
 	}
 
-	// Check did we got file name
-	if (file_name)
-	{
-		// Get file size
-		if (stat(file_name, &st) != 0)
-		{
-			fprintf(stderr, "Error reading file size: %s\n", file_name);
-			return 1;
-		}
-
-		// Allocate memory
-		file_data = malloc(st.st_size);
-
-		// Open file
-		file_fd = open(file_name, O_RDONLY);
-		if (file_fd < 0)
-		{
-			fprintf(stderr, "Error opening file: %s\n", file_name);
-			return 1;
-		}
-
-		// Read data
-		int data_read;
-		int total_read = 0;
-
-		while ((data_read = read(file_fd, file_data + total_read, st.st_size - total_read)) > 0)
-		{
-			if (extra_info)
-			{
-				printf("Read from file: %d bytes\n", data_read);
-			}
-
-			total_read += data_read;
-		}
-
-		close(file_fd);
-
-		// Check that the whole file was read
-		if (total_read != st.st_size)
-		{
-			fprintf(stderr, "Not all data was read from file. Size %d Read %d\n", (int)st.st_size, total_read);
-			return 1;
-		}
-	}
-
 	// Open device
 	device_fd = open(device_name, O_RDONLY);
 	if (device_fd < 0)
@@ -238,41 +194,77 @@ int main(int argc, char * argv[])
 	// If sending file
 	if (file_name)
 	{
+		// Get file size
+		if (stat(file_name, &st) != 0)
+		{
+			fprintf(stderr, "Error reading file size: %s\n", file_name);
+			goto Exit;
+		}
+
+		// Allocate memory
+		file_data = malloc(MAX_SENT_DATA_SIZE);
+
+		// Open file
+		file_fd = open(file_name, O_RDONLY);
+		if (file_fd < 0)
+		{
+			fprintf(stderr, "Error opening file: %s\n", file_name);
+			goto Exit;
+		}
+
 		// Send "Send" in exec command with file size. Bytes 6 - 13 (64bit)
 		struct utp_cmd exec_send;
 		memcpy(&exec_send, &exec, sizeof(exec_send));
 		memcpy(exec_send.data + FILE_SIZE_OFFSET, &st.st_size, sizeof(uint32_t));
 
-		ret = send_cmd(device_fd, &exec_send, command, strlen(command), NULL);
-		if (ret)
+		if (send_cmd(device_fd, &exec_send, command, strlen(command), NULL))
 		{
 			fprintf(stderr, "Send_cmd failed (exec_send)\n");
+			goto Exit;
 		}
 
 		// Send data in put command
 		struct utp_cmd put_send;
 		memcpy(&put_send, &put, sizeof(put_send));
 
-		int data_written = 0;
-		while (data_written < st.st_size)
+		int data_read;
+		int total_read = 0;
+		while (total_read < st.st_size)
 		{
-			int write_size = st.st_size - data_written > MAX_SENT_DATA_SIZE ? MAX_SENT_DATA_SIZE : st.st_size - data_written;
+			int read_size = st.st_size - total_read > MAX_SENT_DATA_SIZE ? MAX_SENT_DATA_SIZE : st.st_size - total_read;
 
-			ret = send_cmd(device_fd, &put_send, file_data + data_written, write_size, NULL);
-			if (ret)
+			if ((data_read = read(file_fd, file_data, read_size)) > 0)
 			{
-				fprintf(stderr, "Send_cmd failed (put_send)\n");
-				break;
+				if (extra_info)
+				{
+					printf("Read from file: %d bytes\n", data_read);
+				}
+
+				total_read += data_read;
+			} else {
+				fprintf(stderr, "Error reading from file: %s (%d)\n", file_name, errno);
+				goto Exit;
 			}
 
-			data_written += write_size;
+			if (send_cmd(device_fd, &put_send, file_data, data_read, NULL))
+			{
+				fprintf(stderr, "Send_cmd failed (put_send)\n");
+				goto Exit;
+			}
 		}
+
+		// Check that the whole file was read
+		if (total_read != st.st_size)
+		{
+			fprintf(stderr, "Not all data was read from file. Size %d Read %d\n", (int)st.st_size, total_read);
+			goto Exit;
+		}
+
 	}
 	else
 	{
 		// Call exec command
-		ret = send_cmd(device_fd, &exec, command, strlen(command), NULL);
-		if (ret)
+		if (send_cmd(device_fd, &exec, command, strlen(command), NULL))
 		{
 			fprintf(stderr, "Send_cmd failed (exec)\n");
 		}
@@ -284,11 +276,10 @@ int main(int argc, char * argv[])
 		{
 			usleep(BUSY_SLEEP);
 
-			ret = send_cmd(device_fd, &poll, "", 0, &reply);
-			if (ret)
+			if (send_cmd(device_fd, &poll, "", 0, &reply))
 			{
 				fprintf(stderr, "Send_cmd failed (poll)\n");
-				break;
+				goto Exit;
 			}
 
 			if (reply == 0)
@@ -299,13 +290,22 @@ int main(int argc, char * argv[])
 			if (i == BUSY_CHECK_COUNT - 1)
 			{
 				fprintf(stderr, "Device is busy\n");
-				ret = 1;
-				break;
+				goto Exit;
 			}
 		}
 	}
 
-	close(device_fd);
+	ret = 0;
+
+Exit:
+	if (device_fd) {
+		close(device_fd);
+	}
+	if (file_fd) {
+		close(file_fd);
+	}
+
+	free(file_data);
 
 	return ret;
 }
