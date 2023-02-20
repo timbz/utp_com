@@ -26,7 +26,7 @@
 #include <scsi/sg_io_linux.h>
 
 #define BUSY_SLEEP           500000
-#define BUSY_CHECK_COUNT     500
+#define BUSY_CHECK_COUNT     1000
 #define CMD_TIMEOUT          (5 * 60 * 1000)
 #define UTP_CMD_SIZE         0x10
 #define UTP_REPLY_BYTE       13
